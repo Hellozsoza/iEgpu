@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Linux -> USB-only usbmuxd tunnel -> iPhone Metal RPC, without a phone weight cache.
+"""iEgpu: a Linux GGUF inference engine with weights on a remote RPC worker.
 
-    python3 scripts/serve-linux.py doctor
-    python3 scripts/serve-linux.py serve --model ~/Models/model.gguf
+    ./iegpu worker
+    ./iegpu serve --rpc 127.0.0.1:50052 --model ~/Models/model.gguf
+    ./iegpu complete --prompt "Hello"
 
-Requires the RPC-only iOS app built from this tree, libimobiledevice, and iproxy.
-Uses Python's standard library. Does not install, pair, or launch apps on the phone.
+The local CPU worker tests the protocol without a phone. Omit --rpc for the
+future USB iPhone worker (requires its app, libimobiledevice, and iproxy).
+The native engine is the pinned llama.cpp; this CLI uses Python's standard library.
 """
 
 import argparse
 import contextlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -21,6 +24,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -129,33 +134,37 @@ def usb_tunnel(udid, timeout=20):
 def remote_device(server, endpoint):
     # Use the real engine handshake instead of guessing the RPC version or device name.
     result = subprocess.run([str(server), "--rpc", endpoint, "--list-devices"],
-                            text=True, capture_output=True, timeout=30, check=True)
+                            text=True, capture_output=True, timeout=30, check=True,
+                            env=engine_environment())
     names = re.findall(r"^\s*(RPC[^\s:]*):", result.stdout + "\n" + result.stderr, re.MULTILINE)
     if len(names) != 1:
-        raise WorkerError("Expected one iPhone RPC GPU. Check the phone's GPU service and ensure "
-                          "the host and app use the same pinned llama.cpp revision.")
+        raise WorkerError("Expected one RPC device. Expose one worker device and use the same "
+                          "pinned llama.cpp revision on both ends.")
     return names[0]
 
 
 def server_command(args, endpoint, device):
     command = [str(args.server), "--model", str(args.model), "--rpc", endpoint,
-            "--device", device, "--n-gpu-layers", str(args.gpu_layers),
+            "--device", device, "--n-gpu-layers", "999",
             "--fit", "off", "--ctx-size", str(args.ctx), "--parallel", "1",
-            "--host", "127.0.0.1", "--port", str(args.port), "--log-verbosity", "4"]
-    if args.gpu_layers == 999:
-        # This pinned engine otherwise keeps input embeddings on the laptop CPU.
-        # One remote server, one exposed GPU: its buffer type is RPC0[endpoint].
-        command.extend(["--override-tensor", f".=RPC0[{endpoint}]"])
+            "--host", "127.0.0.1", "--port", str(args.port), "--log-verbosity", "4",
+            "--load-mode", "none", "--lazy-mode", "off",
+            "--cache-ram", "0", "--ctx-checkpoints", "0",
+            "--override-tensor", f".=RPC0[{endpoint}]"]
     return command
 
 
-def run_server(command, tunnel):
-    env = os.environ.copy()
+def engine_environment():
+    env = {key: value for key, value in os.environ.items() if not key.startswith("LLAMA_ARG_")}
     env["LLAMA_LAZY_EMBD"] = "0"  # a Mac tuning setting would keep embeddings mapped on the host
-    process = subprocess.Popen(command, env=env)
+    return env
+
+
+def run_server(command, tunnel=None):
+    process = subprocess.Popen(command, env=engine_environment())
     try:
         while process.poll() is None:
-            if tunnel.poll() is not None:
+            if tunnel is not None and tunnel.poll() is not None:
                 raise WorkerError("The USB tunnel stopped; stopping inference. Reconnect and restart.")
             time.sleep(0.2)
         return process.returncode
@@ -177,29 +186,98 @@ def port_number(value):
     return number
 
 
+def rpc_endpoint(value):
+    match = re.fullmatch(r"127\.0\.0\.1:([0-9]+)", value)
+    if not match:
+        raise argparse.ArgumentTypeError("use 127.0.0.1:PORT (a local worker or USB/SSH forward)")
+    return f"127.0.0.1:{port_number(match[1])}"
+
+
+def temperature(value):
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be finite and non-negative")
+    return number
+
+
+def complete(args):
+    prompt = args.prompt if args.prompt is not None else sys.stdin.read()
+    data = json.dumps({"prompt": prompt, "n_predict": args.tokens,
+                       "temperature": args.temperature, "cache_prompt": True}).encode()
+    request = urllib.request.Request(f"http://127.0.0.1:{args.port}/completion", data=data,
+                                     headers={"Content-Type": "application/json"})
+    # Ignore proxy environment variables for the local API.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=300) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as error:
+        raise WorkerError(f"Inference API returned HTTP {error.code}; check the server log.") from error
+    except urllib.error.URLError as error:
+        raise WorkerError("Local API unavailable. Start 'iegpu serve' and wait for /health first.") from error
+    if not isinstance(result, dict) or not isinstance(result.get("content"), str):
+        raise WorkerError("Invalid completion response from the inference API.")
+    print(json.dumps(result) if args.json else result["content"])
+    return 0
+
+
 def parser():
-    cli = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    cli = argparse.ArgumentParser(prog="iegpu", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = cli.add_subparsers(dest="action", required=True)
     for action in ("doctor", "serve"):
         p = sub.add_parser(action)
-        p.add_argument("--udid", help="select one USB device (idevice_id -l)")
+        transport = p.add_mutually_exclusive_group()
+        transport.add_argument("--udid", help="select one USB device (idevice_id -l)")
+        transport.add_argument("--rpc", type=rpc_endpoint,
+                               help="direct loopback RPC endpoint; worker must have disk caching disabled")
         p.add_argument("--server", type=Path, default=ROOT / "build/linux-cpu/bin/llama-server")
         if action == "serve":
             p.add_argument("--model", type=Path, required=True, help="local GGUF on the laptop SSD")
             p.add_argument("--ctx", type=positive, default=2048)
-            p.add_argument("--gpu-layers", type=positive, default=999,
-                           help="layers on the phone; reduce for a CPU/phone split")
             p.add_argument("--port", type=port_number, default=8080)
+    p = sub.add_parser("worker", help="run a cache-free local CPU worker for backend development")
+    p.add_argument("--port", type=port_number, default=50052)
+    p.add_argument("--threads", type=positive, default=min(4, os.cpu_count() or 1))
+    p.add_argument("--worker", type=Path, default=ROOT / "build/linux-cpu/bin/ggml-rpc-server")
+    p = sub.add_parser("complete", help="generate text through a running local iEgpu server")
+    p.add_argument("--prompt", "-p", help="prompt text; read stdin when omitted")
+    p.add_argument("--tokens", "-n", type=positive, default=128)
+    p.add_argument("--temperature", type=temperature, default=0.8)
+    p.add_argument("--port", type=port_number, default=8080)
+    p.add_argument("--json", action="store_true", help="print the full completion result")
     return cli
+
+
+def executable(path):
+    path = path.expanduser().resolve()
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise WorkerError("Build the host engine first: bash scripts/build-linux.sh")
+    return path
+
+
+@contextlib.contextmanager
+def connection(args):
+    if args.rpc:
+        # Native RPC does not report its cache policy. USB mode verifies it through
+        # the phone control service; a direct worker is configured by its operator.
+        yield args.rpc, {}, None
+    else:
+        with usb_tunnel(choose_phone(args.udid)) as transport:
+            yield transport
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
     if sys.platform != "linux":
         raise WorkerError("Run this launcher on Linux.")
-    args.server = args.server.expanduser().resolve()
-    if not args.server.is_file() or not os.access(args.server, os.X_OK):
-        raise WorkerError("Build the host engine first: bash scripts/build-linux.sh")
+    if args.action == "complete":
+        return complete(args)
+    if args.action == "worker":
+        binary = executable(args.worker)
+        print(f"Development CPU worker: 127.0.0.1:{args.port}; model disk cache: off", flush=True)
+        return run_server([str(binary), "--host", "127.0.0.1", "--port", str(args.port),
+                           "--device", "CPU", "--threads", str(args.threads)])
+    args.server = executable(args.server)
     if args.action == "serve":
         args.model = args.model.expanduser().resolve()
         if not args.model.is_file():
@@ -207,16 +285,17 @@ def main(argv=None):
         with args.model.open("rb") as model:
             if model.read(4) != b"GGUF":
                 raise WorkerError("The model must be a GGUF file.")
-    udid = choose_phone(args.udid)
-    with usb_tunnel(udid) as (endpoint, info, tunnel):
+    with connection(args) as (endpoint, info, tunnel):
         device = remote_device(args.server, endpoint)
-        print(f"USB iPhone GPU: {device}; phone weight cache: off", flush=True)
+        print(f"Remote device: {device} at {endpoint}; all model weights placed remotely", flush=True)
+        print("Worker disk cache: verified off" if info else
+              "Direct RPC: cache policy is configured by the worker operator (iegpu worker disables it).", flush=True)
         if "avail_mb" in info:
             print(f"Phone app memory available: {info['avail_mb']} MiB (also needed by KV and work buffers)", flush=True)
         if args.action == "doctor":
-            print("USB control and GPU RPC handshakes passed. Inference still needs a model/hardware test.")
+            print("RPC handshake passed. No model loaded.")
             return 0
-        print(f"Loading laptop GGUF over USB; API at http://127.0.0.1:{args.port}/v1 after loading.", flush=True)
+        print(f"Streaming laptop GGUF to RPC memory; API at http://127.0.0.1:{args.port}/v1 after loading.", flush=True)
         return run_server(server_command(args, endpoint, device), tunnel)
 
 
@@ -231,5 +310,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         sys.exit(130)
     except (WorkerError, OSError, subprocess.SubprocessError) as error:
-        print(f"serve-linux: {error}", file=sys.stderr)
+        print(f"iegpu: {error}", file=sys.stderr)
         sys.exit(1)

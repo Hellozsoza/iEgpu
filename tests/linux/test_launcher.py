@@ -69,15 +69,15 @@ class WorkerTests(unittest.TestCase):
 
     def test_weights_and_embeddings_are_on_phone_by_default(self):
         args = argparse.Namespace(server=Path("server"), model=Path("model with spaces.gguf"),
-                                  gpu_layers=999, ctx=2048, port=8080)
+                                  ctx=2048, port=8080)
         command = worker.server_command(args, "localhost:123", "RPC0")
         self.assertEqual(command[command.index("--model") + 1], "model with spaces.gguf")
         self.assertEqual(command[command.index("--device") + 1], "RPC0")
         self.assertEqual(command[command.index("--override-tensor") + 1], ".=RPC0[localhost:123]")
         self.assertEqual(command[command.index("--fit") + 1], "off")
         self.assertEqual(command[command.index("--host") + 1], "127.0.0.1")
-        args.gpu_layers = 8
-        self.assertNotIn("--override-tensor", worker.server_command(args, "localhost:123", "RPC0"))
+        self.assertEqual(command[command.index("--load-mode") + 1], "none")
+        self.assertEqual(command[command.index("--lazy-mode") + 1], "off")
 
     def test_tunnel_is_usb_only_and_cleaned_up_on_cache_rejection(self):
         process = Mock()
@@ -101,9 +101,11 @@ class WorkerTests(unittest.TestCase):
         child.poll.return_value = 7
         tunnel = Mock()
         tunnel.poll.return_value = None
-        with patch.object(worker.subprocess, "Popen", return_value=child) as popen:
+        with patch.object(worker.os, "environ", {"LLAMA_ARG_RPC": "127.0.0.1:1", "LLAMA_LAZY_EMBD": "1"}), \
+                patch.object(worker.subprocess, "Popen", return_value=child) as popen:
             self.assertEqual(worker.run_server(["server"], tunnel), 7)
             self.assertEqual(popen.call_args.kwargs["env"]["LLAMA_LAZY_EMBD"], "0")
+            self.assertNotIn("LLAMA_ARG_RPC", popen.call_args.kwargs["env"])
             child.poll.return_value = None
             tunnel.poll.return_value = 1
             with self.assertRaisesRegex(worker.WorkerError, "tunnel stopped"):
@@ -116,6 +118,30 @@ class WorkerTests(unittest.TestCase):
         process.wait.side_effect = [subprocess.TimeoutExpired("iproxy", 5), 0]
         worker.stop_process(process)
         process.kill.assert_called_once()
+
+    def test_direct_endpoint_needs_no_phone_tools_and_has_no_local_fallback(self):
+        args = worker.parser().parse_args(["serve", "--rpc", "127.0.0.1:50052", "--model", "model.gguf"])
+        with patch.object(worker, "choose_phone", side_effect=AssertionError("USB discovery")):
+            with worker.connection(args) as (endpoint, info, tunnel):
+                self.assertEqual(endpoint, "127.0.0.1:50052")
+                self.assertEqual(info, {})
+                self.assertIsNone(tunnel)
+        for endpoint in ("0.0.0.0:50052", "example.com:50052", "127.0.0.1:0", "127.0.0.1:65536"):
+            with self.subTest(endpoint=endpoint), self.assertRaises(argparse.ArgumentTypeError):
+                worker.rpc_endpoint(endpoint)
+
+    def test_development_worker_never_enables_a_disk_cache(self):
+        with patch.object(worker, "executable", return_value=Path("rpc-server")), \
+                patch.object(worker, "run_server", return_value=0) as run:
+            self.assertEqual(worker.main(["worker", "--port", "50053", "--threads", "2"]), 0)
+            self.assertEqual(run.call_args.args[0], ["rpc-server", "--host", "127.0.0.1", "--port", "50053",
+                                                   "--device", "CPU", "--threads", "2"])
+
+    def test_invalid_model_is_rejected_before_contacting_worker(self):
+        with patch.object(worker, "executable", return_value=Path("server")), \
+                patch.object(worker, "connection", side_effect=AssertionError("contacted worker")):
+            with self.assertRaisesRegex(worker.WorkerError, "does not exist"):
+                worker.main(["serve", "--rpc", "127.0.0.1:50052", "--model", "/nonexistent/model.gguf"])
 
 
 if __name__ == "__main__":

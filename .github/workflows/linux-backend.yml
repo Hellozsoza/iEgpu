@@ -1,0 +1,49 @@
+name: Linux backend
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'iegpu'
+      - 'scripts/build-linux.sh'
+      - 'scripts/serve-linux.py'
+      - 'patches/**'
+      - 'tests/linux/**'
+      - 'llama.cpp'
+      - '.github/workflows/linux-backend.yml'
+  pull_request:
+    paths:
+      - 'iegpu'
+      - 'scripts/build-linux.sh'
+      - 'scripts/serve-linux.py'
+      - 'patches/**'
+      - 'tests/linux/**'
+      - 'llama.cpp'
+      - '.github/workflows/linux-backend.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build native engine and worker
+        run: bash scripts/build-linux.sh
+      - name: Test launcher and listener rules
+        run: |
+          python3 -m unittest discover -s tests/linux -v
+          bash scripts/check-listeners.sh
+      - name: Test GGUF streaming and inference through the real CLI
+        run: python3 tests/linux/smoke_rpc.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-rpc-logs
+          path: build/smoke-*.log
+          if-no-files-found: ignore
+          retention-days: 7

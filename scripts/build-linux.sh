@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the pinned engine with a Linux CPU host and an iPhone RPC device.
+# Build the pinned Linux engine and a RAM-only development RPC worker.
 # BACKEND=vulkan adds local GPU support (Mesa/Vulkan headers required).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -12,13 +12,14 @@ if [[ ! -f llama.cpp/CMakeLists.txt ]]; then
   git submodule update --init --recursive
 fi
 # Apply Linux portability fixes without moving the engine pin or changing its math.
-PATCH="$ROOT/patches/llama-linux.patch"
-if git -C llama.cpp apply --check "$PATCH" 2>/dev/null; then
-  git -C llama.cpp apply "$PATCH"
-elif ! git -C llama.cpp apply --reverse --check "$PATCH" 2>/dev/null; then
-  echo "build-linux: portability patch does not match this engine; inspect local llama.cpp changes" >&2
-  exit 1
-fi
+for PATCH in "$ROOT/patches/llama-linux.patch" "$ROOT/patches/llama-remote-stream.patch"; do
+  if git -C llama.cpp apply --check "$PATCH" 2>/dev/null; then
+    git -C llama.cpp apply "$PATCH"
+  elif ! git -C llama.cpp apply --reverse --check "$PATCH" 2>/dev/null; then
+    echo "build-linux: $PATCH does not match this engine; inspect local llama.cpp changes" >&2
+    exit 1
+  fi
+done
 BACKEND=${BACKEND:-cpu}
 case "$BACKEND" in
   cpu) VULKAN=OFF ;;
@@ -37,5 +38,5 @@ if [[ -z "${JOBS:-}" ]]; then
   JOBS=$(nproc)
   if (( JOBS > 4 )); then JOBS=4; fi
 fi
-cmake --build "build/linux-$BACKEND" --target llama-server -j "$JOBS"
-echo "Built build/linux-$BACKEND/bin/llama-server"
+cmake --build "build/linux-$BACKEND" --target llama-server ggml-rpc-server -j "$JOBS"
+echo "Built engine and development worker. Run ./iegpu --help"

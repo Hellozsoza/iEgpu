@@ -1,0 +1,20 @@
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1738,6 +1738,16 @@
+                         ++buffer_idx;
+                         buffer_idx %= n_buffers;
+                     }
++                } else if (!check_tensors && strncmp(ggml_backend_buffer_name(cur->buffer), "RPC", 3) == 0) {
++                    const size_t chunk_size = 8 * MiB;
++                    std::vector<no_init<uint8_t>> read_buf(std::min(n_size, chunk_size));
++                    file->seek(weight->offs, SEEK_SET);
++                    LLAMA_LOG_INFO("%s: streaming RPC tensor '%s', %zu bytes, staging <= %zu bytes\n", __func__, ggml_get_name(cur), n_size, chunk_size);
++                    for (size_t offset = 0; offset < n_size; offset += chunk_size) {
++                        const size_t count = std::min(chunk_size, n_size - offset);
++                        file->read_raw(read_buf.data(), count);
++                        ggml_backend_tensor_set(cur, read_buf.data(), offset, count);
++                    }
+                 } else {
+                     // scoped to one tensor so only one staging buffer is alive at a time
+                     std::vector<no_init<uint8_t>> read_buf(n_size);
