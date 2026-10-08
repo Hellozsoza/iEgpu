@@ -1,0 +1,30 @@
+name: Build iEgpu iPhone worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  iphone-worker:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Run Mac security checks
+        run: bash tests/security/run.sh
+      - name: Build unsigned RAM-only worker for iOS 26+
+        env:
+          RPC_ONLY: '1'
+          IPA: '1'
+          MIN_IOS: '26.0'
+        run: bash scripts/build-iphone.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iEgpu-iOS26-worker
+          path: ios/build/iEgpu.ipa
+          if-no-files-found: error
+          retention-days: 14

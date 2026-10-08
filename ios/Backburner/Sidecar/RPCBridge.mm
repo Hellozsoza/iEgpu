@@ -341,7 +341,9 @@ static int g_tail_ane_n = 0;
 // Mac with phone-push.py + relaunch, no reinstall. Documents/metal/ggml-metal-embed-<kind>.metal replaces that kind's
 // built-in Metal kernels (GGML_METAL_KERNELS_DIR; scripts/phone-kernels.sh pushes them).
 static char g_env_note[160];   // plain buffer: filled by the constructor below, before C++ globals may exist
+static std::atomic<bool> g_rpc_cache_enabled { false };
 __attribute__((constructor)) static void sidecar_env_defaults() {
+#if !SIDECAR_RPC_ONLY
     setenv("GGML_METAL_FA_PREFILL_GQA", "1", 0);
     // the prefill tail's weights (~5 GB for L40) stay wired while idle unless the residency is ENDED. Released 5 s after the last
     // graph, but ONLY while the ANE page engine wants the memory (phone-held KV: ggml_backend_metal_set_residency_release from
@@ -372,6 +374,7 @@ __attribute__((constructor)) static void sidecar_env_defaults() {
             strlcat(g_env_note, b, sizeof(g_env_note));
         }
     }
+#endif
 }
 static bool g_tail_ane_on = false;
 // What the Mac is doing (its proxy and serve-infernet.sh send "mac PHASE [N1] [N2] [CTX]" to :50061): starting, ready,
@@ -481,12 +484,14 @@ static std::atomic<pa::ane_engine *> g_pa_ane { nullptr };   // phone-attn's ANE
             devices.push_back(dev);
         }
     }
+#if !SIDECAR_RPC_ONLY
     if (devices.empty()) {
         ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu) {
             devices.push_back(cpu);
         }
     }
+#endif
     if (devices.empty()) {
         return @"no ggml devices (Metal missing?)";
     }
@@ -505,7 +510,12 @@ static std::atomic<pa::ane_engine *> g_pa_ane { nullptr };   // phone-attn's ANE
     (void)host;
     std::string endpoint = "127.0.0.1:" + std::to_string(port + RPC_INTERNAL_OFFSET);
     unsigned n_threads = std::max(1u, (unsigned)[[NSProcessInfo processInfo] processorCount] / 2);
-    fn(endpoint.c_str(), cacheDir.UTF8String, n_threads, devices.size(), devices.data());
+    const char *cache = cacheDir.length ? cacheDir.UTF8String : nullptr;
+#if SIDECAR_RPC_ONLY
+    cache = nullptr;   // never persist streamed model weights, even if a caller passes a directory
+#endif
+    g_rpc_cache_enabled.store(cache != nullptr);
+    fn(endpoint.c_str(), cache, n_threads, devices.size(), devices.data());
     return @"rpc server returned";
 }
 
@@ -576,6 +586,12 @@ static id<MLFeatureProvider> ane_input(MLModel *m, double *flops, int *S_out) {
 static NSDictionary *ane_cmd(NSArray<NSString *> *a) {
     NSString *op = a.count ? a[0] : @"";
     NSMutableDictionary *r = ane_mem();
+#if SIDECAR_RPC_ONLY
+    if (![op isEqualToString:@"mem"]) {
+        r[@"error"] = @"GPU worker control supports only mem; model weights arrive through RPC";
+        return r;
+    }
+#endif
     // every argument that names a file must stay inside Documents, and fetch may only download from the Mac over the cable
     // (CableOnly.h; tests/security/cable-policy-test.cpp)
     {
@@ -631,6 +647,12 @@ static NSDictionary *ane_cmd(NSArray<NSString *> *a) {
         return r;
     }
     if ([op isEqualToString:@"mem"]) {
+        r[@"rpc_cache_enabled"] = @(g_rpc_cache_enabled.load());
+#if SIDECAR_RPC_ONLY
+        r[@"rpc_only"] = @YES;
+#else
+        r[@"rpc_only"] = @NO;
+#endif
         std::lock_guard<std::mutex> lk(g_tail_status.mu);
         r[@"tail_sync"] = [NSString stringWithUTF8String:g_tail_status.last_sync.c_str()] ?: @"";
         r[@"tail_last_chunk_ms"] = @(g_tail_status.last_chunk_ms);

@@ -5,6 +5,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface SidecarRPC : NSObject
 /// ggml RPC server: listens on 127.0.0.1:(port + 1000) only; a cable-only gate owns `port` (`host` is ignored).
 /// Blocking. Call off the main thread. Returns nil on clean exit (it does not return while listening).
+/// An empty cacheDir disables disk caching. RPC_ONLY builds always disable it.
 + (nullable NSString *)startHost:(NSString *)host port:(int)port cacheDir:(NSString *)cacheDir
     NS_SWIFT_NAME(start(host:port:cacheDir:));
 /// The USB-cable address only: one 169.254 IPv4, or empty. Wi-Fi and IPv6 are not returned.

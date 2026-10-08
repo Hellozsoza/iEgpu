@@ -2,6 +2,7 @@
 # build-iphone.sh - the iPhone app: llama.xcframework for iOS (Metal + ggml-rpc), the SME2 attention kernel, then the app.
 #   DEVELOPMENT_TEAM=<your Apple team id> [UDID=<iPhone UDID>] scripts/build-iphone.sh
 #   IPA=1 scripts/build-iphone.sh      # no team id: ios/build/Backburner.ipa for AltStore (docs/INSTALL-IPHONE.md)
+#   RPC_ONLY=1 IPA=1 scripts/build-iphone.sh  # iEgpu Linux worker, iOS 26+, no phone model storage
 # With UDID set (and the phone wired and unlocked) it installs the app; otherwise it prints where the .app is.
 # Xcode 27 public cannot debug iOS 27.2 (DDI). It can still archive + devicectl install.
 set -euo pipefail
@@ -11,7 +12,19 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LLAMA="${LLAMA_DIR:-${ROOT}/llama.cpp}"
 IOS="${ROOT}/ios/Backburner"
 FW="${IOS}/Frameworks"
-MIN_IOS="${MIN_IOS:-16.4}"
+RPC_ONLY="${RPC_ONLY:-0}"
+IPA_NAME=Backburner
+PROFILE_ARGS=()
+if [[ "$RPC_ONLY" == 1 ]]; then
+  IPA_NAME=iEgpu
+  MIN_IOS="${MIN_IOS:-26.0}"
+  PROFILE_ARGS=('OTHER_CFLAGS=$(inherited) -DSIDECAR_RPC_ONLY=1'
+                'OTHER_SWIFT_FLAGS=$(inherited) -DSIDECAR_RPC_ONLY'
+                "IPHONEOS_DEPLOYMENT_TARGET=$MIN_IOS"
+                'INFOPLIST_KEY_CFBundleDisplayName=iEgpu')
+else
+  MIN_IOS="${MIN_IOS:-16.4}"
+fi
 JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 IPA="${IPA:-0}"
 TEAM="${DEVELOPMENT_TEAM:-}"
@@ -176,6 +189,7 @@ xcodebuild \
   -configuration Release \
   -destination "generic/platform=iOS" \
   "${SIGN_ARGS[@]}" \
+  "${PROFILE_ARGS[@]}" \
   -archivePath "${ROOT}/ios/build/Sidecar.xcarchive" \
   archive
 
@@ -196,10 +210,10 @@ if [[ "${IPA}" == 1 ]]; then
   codesign -f -s - --entitlements "${IOS}/Sidecar/Sidecar.entitlements" "${P}/Payload/Sidecar.app"
   codesign -d --entitlements - "${P}/Payload/Sidecar.app" 2>/dev/null | grep -q increased-memory-limit \
     || { echo "IPA is missing the increased-memory-limit entitlement"; exit 1; }
-  rm -f "${ROOT}/ios/build/Backburner.ipa"
-  (cd "${P}" && zip -qry "${ROOT}/ios/build/Backburner.ipa" Payload)
+  rm -f "${ROOT}/ios/build/${IPA_NAME}.ipa"
+  (cd "${P}" && zip -qry "${ROOT}/ios/build/${IPA_NAME}.ipa" Payload)
   rm -rf "${P}"
-  echo "ipa: ${ROOT}/ios/build/Backburner.ipa ($(du -h "${ROOT}/ios/build/Backburner.ipa" | cut -f1)). Install: docs/INSTALL-IPHONE.md"
+  echo "ipa: ${ROOT}/ios/build/${IPA_NAME}.ipa ($(du -h "${ROOT}/ios/build/${IPA_NAME}.ipa" | cut -f1)). Install: docs/INSTALL-IPHONE.md"
   exit 0
 fi
 

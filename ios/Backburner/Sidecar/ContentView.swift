@@ -88,7 +88,7 @@ struct ContentView: View {
         ZStack {
             Color.black.ignoresSafeArea()
             // the full screen stays alive under the dim view (no rebuild, no replayed draw-in); only opacity changes
-            fullView
+            activeView
                 .opacity(dim ? 0 : 1)
                 .allowsHitTesting(!dim)
             dimView
@@ -102,10 +102,14 @@ struct ContentView: View {
             machine = SidecarRPC.deviceModel()
             envNote = SidecarRPC.envNote()
             startRPC()
+#if !SIDECAR_RPC_ONLY
             startTail()
+#endif
             SidecarRPC.startANEBench(port: 50061)
+#if !SIDECAR_RPC_ONLY
             SidecarRPC.startPhoneAttn(port: 50062)
             WifiTunnel.startIfPaired()
+#endif
             refresh()
             appearAt = Date()
         }
@@ -118,6 +122,28 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder private var activeView: some View {
+#if SIDECAR_RPC_ONLY
+        VStack(alignment: .leading, spacing: 20) {
+            Text("iEgpu").font(.largeTitle.bold())
+            Text("iPhone GPU worker").font(.title2)
+            Text("Model weights arrive over USB and stay in RAM. No model weight cache is written to this phone.")
+            Text("GPU service: \(rpc.state)")
+            if !rpcError.isEmpty { Text(rpcError).foregroundStyle(.orange) }
+            Text("Available to app: \(gib(memAvail))")
+            Text("GPU allocated: \(gib(gpuAlloc))")
+            Text(String(format: "USB / link traffic: %.1f MB/s in, %.1f MB/s out", rxRate / 1e6, txRate / 1e6))
+            Text("Keep this app open and the phone unlocked. Locking, switching apps, or disconnecting the cable stops inference.")
+                .font(.footnote)
+            Text("Tap to dim the screen.").font(.footnote)
+        }
+        .foregroundStyle(.white)
+        .padding(24)
+#else
+        fullView
+#endif
     }
 
     // MARK: what the phone is doing, in plain words
@@ -489,13 +515,21 @@ struct ContentView: View {
     // MARK: dim screen
 
     private var dimView: some View {
-        Text(headline)
+        Text(dimHeadline)
             .font(.system(size: 17, design: .serif))
             .multilineTextAlignment(.center)
             .foregroundStyle(Color(white: 0.2))
             .padding(.horizontal, 48)
             .offset(drift)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var dimHeadline: String {
+#if SIDECAR_RPC_ONLY
+        rpcError.isEmpty ? "iEgpu GPU worker" : "GPU service stopped"
+#else
+        headline
+#endif
     }
 
     private func toggleDim() {
@@ -781,12 +815,18 @@ struct ContentView: View {
         guard !rpcRunning else { return }
         rpcRunning = true
         rpcError = ""
+        // The Linux worker must never create a disk cache of model tensors.
+#if SIDECAR_RPC_ONLY
+        let cachePath = ""
+#else
         let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("rpc", isDirectory: true)
         try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        let cachePath = cache.path
+#endif
         let port = rpcPort
         DispatchQueue.global(qos: .userInitiated).async {
-            let err = SidecarRPC.start(host: "127.0.0.1", port: port, cacheDir: cache.path)
+            let err = SidecarRPC.start(host: "127.0.0.1", port: port, cacheDir: cachePath)
             DispatchQueue.main.async {
                 rpcRunning = false
                 rpcError = (err ?? "stopped") + ". Restarting."
